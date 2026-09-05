@@ -54,8 +54,8 @@ jobs:
   build:
     runs-on: ${{ matrix.runner }}
     concurrency:
-      group: ${{ github.workflow }}-${{ matrix.run_phase }}-${{ matrix.cross_arch || 'native' }}-${{ github.ref }}-${{ matrix.runner }}-${{ inputs.leg || 'push' }}
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-${{ matrix.run_phase }}-${{ matrix.cross_arch || 'native' }}-${{ github.ref }}-${{ matrix.runner }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -118,8 +118,8 @@ jobs:
     name: Build & test (musl, postmarketOS)
     runs-on: ubuntu-24.04
     concurrency:
-      group: ${{ github.workflow }}-musl-${{ github.ref }}-${{ inputs.leg || 'push' }}
-      cancel-in-progress: true
+      group: ${{ github.workflow }}-musl-${{ github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+      cancel-in-progress: false
     steps:
       - name: Repository checkout
         uses: crashappsec/action-checkout@main
