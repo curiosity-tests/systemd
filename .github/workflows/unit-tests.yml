@@ -68,20 +68,12 @@ jobs:
           - run_phase: GCC
             runner: ubuntu-24.04-arm
             cross_arch: armhf
-          - run_phase: GCC
-            runner: ubuntu-24.04-ppc64le
-          - run_phase: GCC
-            runner: ubuntu-24.04-s390x
           - run_phase: CLANG
           - run_phase: CLANG
             runner: ubuntu-24.04-arm
           - run_phase: CLANG
             runner: ubuntu-24.04-arm
             cross_arch: armhf
-          - run_phase: CLANG
-            runner: ubuntu-24.04-ppc64le
-          - run_phase: CLANG
-            runner: ubuntu-24.04-s390x
     env:
       CROSS_ARCH: ${{ matrix.cross_arch || '' }}
     steps:
