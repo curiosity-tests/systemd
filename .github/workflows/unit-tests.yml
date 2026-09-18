@@ -1,21 +1,3 @@
-
-# racecar fork-testbed patch. Changes from upstream:
-#   1. workflow_dispatch with a `leg` input so racecar can drive the run and pick
-#      baseline vs instrumented.
-#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
-#      setup-chalk-action; `chalk:` is the only variable separating the arms.
-#   3. permissions: id-token: write for the action's OIDC connect (the block
-#      zeroes unlisted scopes, so everything upstream relied on is restated).
-#   4. A fail-closed assertion on the instrumented arm.
-#   5. fail-fast: false on every matrix -- a measurement-integrity change, not a
-#      build change: the instrumented arm has strictly more failure surface, so
-#      leaving fail-fast on cancels instrumented siblings more often than
-#      baseline ones and biases the comparison.
-#   6. the concurrency group carries the leg. Both arms run on the same ref, so
-#      upstream's github.ref-keyed group put them in one group and the second
-#      dispatch cancelled the first. Also cancellation-only, never a build change.
-# Build and test COMMANDS are unchanged from upstream.
----
 # vi: ts=2 sw=2 et:
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
@@ -40,8 +22,8 @@ on:
         default: ""
   pull_request:
     branches:
-      - main
-      - v[0-9]+-stable
+    - main
+    - v[0-9]+-stable
 
 permissions:
   contents: read
@@ -59,53 +41,121 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ ubuntu-24.04 ]
+        runner: [ubuntu-24.04]
         run_phase: [GCC, GCC_ASAN_UBSAN, CLANG, CLANG_RELEASE, CLANG_ASAN_UBSAN, CLANG_ASAN_UBSAN_NO_DEPS]
         include:
-          - run_phase: GCC
-          - run_phase: GCC
-            runner: ubuntu-24.04-arm
-          - run_phase: GCC
-            runner: ubuntu-24.04-arm
-            cross_arch: armhf
-          - run_phase: CLANG
-          - run_phase: CLANG
-            runner: ubuntu-24.04-arm
-          - run_phase: CLANG
-            runner: ubuntu-24.04-arm
-            cross_arch: armhf
+        - run_phase: GCC
+        - run_phase: GCC
+          runner: ubuntu-24.04-arm
+        - run_phase: GCC
+          runner: ubuntu-24.04-arm
+          cross_arch: armhf
+        - run_phase: CLANG
+        - run_phase: CLANG
+          runner: ubuntu-24.04-arm
+        - run_phase: CLANG
+          runner: ubuntu-24.04-arm
+          cross_arch: armhf
     env:
       CROSS_ARCH: ${{ matrix.cross_arch || '' }}
     steps:
-      - name: Repository checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          persist-credentials: false
+    - name: Repository checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        persist-credentials: false
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Install build dependencies
+      run: |
+        # Drop XDG_* stuff from /etc/environment, so we don't get the user
+        # XDG_* variables when running under sudo
+        sudo sed -i '/^XDG_/d' /etc/environment
+        # Pass only specific env variables through sudo, to avoid having
+        # the already existing XDG_* stuff on the "other side"
+        sudo --preserve-env=GITHUB_ACTIONS,CI,CROSS_ARCH .github/workflows/unit-tests.sh SETUP
+    - name: Build & test
+      run: sudo --preserve-env=GITHUB_ACTIONS,CI,CROSS_ARCH .github/workflows/unit-tests.sh RUN_${{ matrix.run_phase }}
 
-      - name: Install build dependencies
-        run: |
-          # Drop XDG_* stuff from /etc/environment, so we don't get the user
-          # XDG_* variables when running under sudo
-          sudo sed -i '/^XDG_/d' /etc/environment
-          # Pass only specific env variables through sudo, to avoid having
-          # the already existing XDG_* stuff on the "other side"
-          sudo --preserve-env=GITHUB_ACTIONS,CI,CROSS_ARCH .github/workflows/unit-tests.sh SETUP
-      - name: Build & test
-        run: sudo --preserve-env=GITHUB_ACTIONS,CI,CROSS_ARCH .github/workflows/unit-tests.sh RUN_${{ matrix.run_phase }}
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   build-musl:
     name: Build & test (musl, postmarketOS)
     runs-on: ubuntu-24.04
@@ -113,48 +163,115 @@ jobs:
       group: ${{ github.workflow }}-musl-${{ github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
       cancel-in-progress: false
     steps:
-      - name: Repository checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          persist-credentials: false
+    - name: Repository checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        persist-credentials: false
 
-      - name: Assert instrumentation is live
-        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
-        # LD_PRELOAD once it has injected, so an empty value is what success
-        # looks like. co-hostd also daemonizes, so pgrep does not match it.
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - uses: systemd/mkosi@f7762b71437227922a367bb89597843c77494ef9
 
+    - name: Build tools tree
+      run: |
+        tee mkosi/mkosi.local.conf <<EOF
+        [Build]
+        ToolsTreeDistribution=postmarketos
+        EOF
 
-      - uses: systemd/mkosi@f7762b71437227922a367bb89597843c77494ef9
+        mkosi -f box -- true
 
-      - name: Build tools tree
-        run: |
-          tee mkosi/mkosi.local.conf <<EOF
-          [Build]
-          ToolsTreeDistribution=postmarketos
-          EOF
+    - name: Build
+      run: |
+        mkosi box -- \
+            meson setup \
+                --werror \
+                -Dtests=unsafe \
+                -Dslow-tests=true \
+                -Dfuzz-tests=true \
+                -Dlibc=musl \
+                -Ddlopen-tests=true \
+                build
+        mkosi box -- ninja -v -C build
 
-          mkosi -f box -- true
+    - name: Test
+      run: mkosi box -- meson test -C build --print-errorlogs --no-stdsplit --quiet
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - name: Build
-        run: |
-          mkosi box -- \
-              meson setup \
-                  --werror \
-                  -Dtests=unsafe \
-                  -Dslow-tests=true \
-                  -Dfuzz-tests=true \
-                  -Dlibc=musl \
-                  -Ddlopen-tests=true \
-                  build
-          mkosi box -- ninja -v -C build
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
 
-      - name: Test
-        run: mkosi box -- meson test -C build --print-errorlogs --no-stdsplit --quiet
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
