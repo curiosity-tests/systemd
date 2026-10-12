@@ -3,10 +3,9 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 name: Scorecards supply-chain security
 on:
+  workflow_dispatch:
   # Only the default branch is supported.
   branch_protection_rule:
-  schedule:
-    - cron: '15 21 * * 6'
   push:
     branches:
       - main
